@@ -68,6 +68,32 @@ def _intersect_line(
     return (origin[0] + t * direction[0], origin[1] + t * direction[1])
 
 
+def _refracted_tangential(
+    direction: tuple[float, float],
+    normal: tuple[float, float],
+    cos_i: float,
+    eta: float,
+) -> tuple[float, float]:
+    """折射方向的切向分量 eta·(d − cos_i·n)（数值稳定形式）。
+
+    切向分量由向量分解 d_perp = d − cos_i·n 直接取得，不经 1 − cos_i² 反推：
+    正入射时严格为零向量（直接返回 (0, 0)，折射率比溢出为 inf 时也不会
+    出现 0×∞），极小切向分量（如 5e-201）在减法中精确保留，不因浮点抵消
+    丢失。分量量级由 |eta·d_perp| 直接给出，无需计算会溢出的 eta²。
+    折射率比本身溢出为无穷（如 1e200 对 1e-200）时，任何非零切向分量的
+    sin_t 均为无穷、必全反射，返回无穷切向分量供上层按 sin²t > 1 判定。
+    """
+    perp = (
+        direction[0] - cos_i * normal[0],
+        direction[1] - cos_i * normal[1],
+    )
+    if perp == (0.0, 0.0):
+        return (0.0, 0.0)  # 正入射：无切向分量，避免 0×∞
+    if math.isinf(eta):
+        return (math.inf, math.inf)  # 非零切向分量 × 无穷折射率比：必全反射
+    return (eta * perp[0], eta * perp[1])
+
+
 def _refract(
     direction: tuple[float, float],
     normal: tuple[float, float],
@@ -77,18 +103,24 @@ def _refract(
     """按斯涅尔定律计算折射方向；发生全反射时返回 None。
 
     若光线从法线背面入射，则翻转法线再计算（折射率仍按给定 n1 -> n2）。
+
+    方向按数值稳定形式合成：折射方向 = 切向分量 eta·d_perp + 法向分量
+    cos_t·n，全反射判定用 sin²t = |eta·d_perp|²（见 _refracted_tangential）。
+    不计算 eta²、不经 1 − cos_i² 反推切向分量，因此折射率比极大（如
+    n1=1e200、n2=1）时正入射保持原方向，微小切向分量仍得有限单位方向，
+    越界时正确判为全反射。
     """
     cos_i = _dot(direction, normal)
     if cos_i < 0.0:
         normal = (-normal[0], -normal[1])
         cos_i = -cos_i
     eta = n1 / n2
-    sin2_t = eta * eta * max(0.0, 1.0 - cos_i * cos_i)
+    t_perp = _refracted_tangential(direction, normal, cos_i, eta)
+    sin2_t = t_perp[0] * t_perp[0] + t_perp[1] * t_perp[1]
     if sin2_t > 1.0:
         return None  # 全反射
     cos_t = math.sqrt(1.0 - sin2_t)
-    k = cos_t - eta * cos_i
-    return (eta * direction[0] + k * normal[0], eta * direction[1] + k * normal[1])
+    return (t_perp[0] + cos_t * normal[0], t_perp[1] + cos_t * normal[1])
 
 
 def fresnel_transmittance(
@@ -100,7 +132,9 @@ def fresnel_transmittance(
     """单界面菲涅耳 s/p 功率透过率（数值稳定形式，与 1 - R 精确等价）。
 
     以光线方向与界面法线求入射角余弦 cos_i（光线从法线背面入射时翻转法线），
-    再由斯涅尔定律 sin_t = (n1/n2) sin_i 求折射角余弦 cos_t。功率透过率按
+    再由斯涅尔定律 sin_t = (n1/n2) sin_i 求折射角余弦 cos_t（sin²t 按数值稳定
+    形式 |eta·d_perp|² 计算，见 _refracted_tangential：不计算会溢出的 eta²，
+    正入射不出现 0×∞，极大折射率比下微小切向分量不丢失）。功率透过率按
         Ts = 4·as·bs/(as+bs)²，as = n1·cos_i，bs = n2·cos_t
         Tp = 4·ap·bp/(ap+bp)²，ap = n2·cos_i，bp = n1·cos_t
     计算，实现时取 4·[a/(a+b)]·[b/(a+b)]：只含正项之和与不超过 1 的比值，
@@ -114,7 +148,8 @@ def fresnel_transmittance(
         nrm = (-nrm[0], -nrm[1])
         cos_i = -cos_i
     eta = n1 / n2
-    sin2_t = eta * eta * max(0.0, 1.0 - cos_i * cos_i)
+    t_perp = _refracted_tangential(direction, nrm, cos_i, eta)
+    sin2_t = t_perp[0] * t_perp[0] + t_perp[1] * t_perp[1]
     if sin2_t > 1.0:
         return None  # 全反射
     cos_t = math.sqrt(max(0.0, 1.0 - sin2_t))

@@ -80,6 +80,44 @@ curl -X POST http://localhost:8000/api/traces \
 # status = "total_internal_reflection"，reason 说明入射角超过临界角
 ```
 
+### 极端折射率比边界示例
+
+折射率比极大（如 `n_start=1e200`、`n_next=1`，比值 1e200，其平方已超出双精度浮点范围）时，几何层按数值稳定形式做斯涅尔判定与方向合成：折射方向 = 切向分量 `eta·d_perp` + 法向分量 `cos_t·n`，其中切向分量由向量分解 `d_perp = d − cos_i·n` 直接取得——不计算会溢出的折射率比平方 `eta²`，也不经 `1 − cos_i²` 反推切向分量（避免 `0×∞` 与浮点抵消），因此：
+
+- **正入射**（切向分量为 0）：折射方向严格保持原方向，不产生 NaN；
+- **极小切向分量**（如 `5e-201`）：在向量分解中精确保留，得到有限的单位折射方向；
+- **越界切向分量**（如 `2e-200`，折射后切向分量模长 2 > 1）：正确判为全反射，不漏判。
+
+```bash
+# 切向分量 5e-201：折射率比 1e200 下折射方向为有限单位向量 (0.866..., 0.5)
+curl -X POST http://localhost:8000/api/traces \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "direction": {"x": 1, "y": 5e-201},
+    "n_start": 1e200,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ]
+  }'
+# status = "completed"，出射段 direction ≈ {"x": 0.8660254037844386, "y": 0.5}
+
+# 切向分量 2e-200：sin_t = 1e200 × 2e-200 = 2 > 1，判为全反射
+curl -X POST http://localhost:8000/api/traces \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "direction": {"x": 1, "y": 2e-200},
+    "n_start": 1e200,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ]
+  }'
+# status = "total_internal_reflection"
+```
+
+多界面追迹继续使用修正后的有限方向做前向求交；提交（`POST /api/traces`）与查询（`GET /api/traces/{id}`、`GET /api/traces/{id}/segments/{seg_index}`）接口对同一追迹给出一致的有限分段结果。
+
 ## 追迹结果对比
 
 `POST /api/traces/compare` 接收两个已保存追迹编号与非负的位置/方向容差，按 `seg_index` 对齐两条追迹的状态与分段并返回差异。该接口为**只读比较**，不修改任何已保存记录。
@@ -881,7 +919,7 @@ curl -X POST http://localhost:8000/api/chromatic-beam-evaluations \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、柯西色散折射率（n=A+B/λ²）
+  geometry.py   二维求交、数值稳定的斯涅尔折射（极大折射率比下不溢出、正入射保持方向）、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、柯西色散折射率（n=A+B/λ²）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型
