@@ -8,7 +8,14 @@
 docker compose up --build
 ```
 
-启动时会安装依赖并自动建库建表（SQLite 文件存于命名卷 `raytrace-data` 中）。
+启动时会安装依赖并自动建库建表（SQLite 文件存于命名卷 `raytrace-data` 中）。验证服务已就绪：
+
+```bash
+curl http://localhost:8000/
+# {"service":"2d-ray-tracing","docs":"/docs","api":"/api/traces"}
+```
+
+停止服务：`docker compose down`（加 `-v` 可连同数据卷一起删除）。
 
 - **API 地址**：http://localhost:8000
 - **交互式文档（Swagger UI）**：http://localhost:8000/docs
@@ -79,6 +86,55 @@ curl -X POST http://localhost:8000/api/traces \
   }'
 # status = "total_internal_reflection"，reason 说明入射角超过临界角
 ```
+
+### 极端折射率比边界示例
+
+几何层的斯涅尔判定**不计算折射率比的平方**（`eta²` 在 `n1=1e200、n2=1` 时达 1e400，越出 float64 表示范围），而是由入射方向减去向法向投影得到切向向量、以其模长为 `sin_i`，再算 `sin_t = (n1/n2)·sin_i` 判定全反射；方向按 `eta·切向向量 + cos_t·法线` 合成并归一化。正入射（切向分量为 0）时保持原方向，多界面追迹继续使用修正后的有限单位方向做前向求交，追迹提交与查询接口因此始终给出有限的各段方向与交点。
+
+以 `n_start=1e200`、界面法线 `(1,0)`、`n_next=1`（临界角正弦为 `1e-200`）为例：
+
+```bash
+# 正入射：保持原方向 (1, 0)
+curl -X POST http://localhost:8000/api/traces \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "direction": {"x": 1, "y": 0},
+    "n_start": 1e200,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ]
+  }'
+# status = "completed"，出射段 direction = {"x": 1.0, "y": 0.0}
+
+# 切向分量 5e-201（小于临界正弦 1e-200）：sin_t = 1e200 × 5e-201 = 0.5
+curl -X POST http://localhost:8000/api/traces \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "direction": {"x": 1, "y": 5e-201},
+    "n_start": 1e200,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ]
+  }'
+# status = "completed"，出射段 direction ≈ {"x": 0.8660254037844386, "y": 0.5}（有限单位向量）
+
+# 切向分量 2e-200（大于临界正弦 1e-200）：sin_t = 2 > 1
+curl -X POST http://localhost:8000/api/traces \
+  -H "Content-Type: application/json" \
+  -d '{
+    "start": {"x": 0, "y": 0},
+    "direction": {"x": 1, "y": 2e-200},
+    "n_start": 1e200,
+    "interfaces": [
+      {"point": {"x": 2, "y": 0}, "normal": {"x": 1, "y": 0}, "n_next": 1.0}
+    ]
+  }'
+# status = "total_internal_reflection"
+```
+
+同一套斯涅尔判定也用于菲涅耳功率透过率（见功率评估），追迹接口与功率接口对全反射的判定保持一致。
 
 ## 追迹结果对比
 
@@ -881,7 +937,7 @@ curl -X POST http://localhost:8000/api/chromatic-beam-evaluations \
 ```
 app/
   main.py       FastAPI 路由与生命周期（启动时建库）
-  geometry.py   二维求交、斯涅尔折射、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、柯西色散折射率（n=A+B/λ²）
+  geometry.py   二维求交、数值稳定的斯涅尔折射（不取折射率比平方，正入射保持原方向）、方向采样、光斑质心/RMS、菲涅耳 s/p 透过率与功率加权质心、探测线功率分箱（相邻分箱中心线性分配、边缘截断）、波前光程与等权最小二乘直线拟合、瞄准求解（扫描+二分）、装调灵敏度（逐界面法线 ±扰动与中心差分）、焦点搜索（观察线沿法线平移扫描 + 低谷黄金分割细化）、折射率标定（固定其余界面替换目标 n_next，均方残差扫描 + 低谷黄金分割细化）、有限口径追迹（逐界面口径半宽检查，首个失败界面终止）、柯西色散折射率（n=A+B/λ²）
   comparison.py 两条已保存追迹的状态与分段对齐比较（统一浮点容差、缺段报告）
   db.py         SQLite 持久化（traces / segments 两表）
   schemas.py    Pydantic 请求 / 响应模型

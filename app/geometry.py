@@ -68,6 +68,37 @@ def _intersect_line(
     return (origin[0] + t * direction[0], origin[1] + t * direction[1])
 
 
+def _snell_angles(
+    direction: tuple[float, float],
+    normal: tuple[float, float],
+    n1: float,
+    n2: float,
+) -> tuple[float, float, tuple[float, float], tuple[float, float]] | None:
+    """斯涅尔判定的数值稳定形式；发生全反射时返回 None。
+
+    返回 (cos_i, sin_t, 入射侧单位法线, 切向向量)。光线从法线背面入射时
+    翻转法线再计算（折射率仍按给定 n1 -> n2）。切向向量 = d − cos_i·n，
+    其模长即 sin_i：直接由方向分量求得，即使切向分量极小（如 5e-201）
+    也不会被 1 − cos_i² 的浮点抵消吞掉。随后取 sin_t = (n1/n2)·sin_i，
+    不计算折射率比的平方，避免极端折射率比下 eta² 溢出（如 n1=1e200、
+    n2=1 时 eta²=1e400 越出 float64）及正入射时的 0×∞。
+    """
+    cos_i = _dot(direction, normal)
+    if cos_i < 0.0:
+        normal = (-normal[0], -normal[1])
+        cos_i = -cos_i
+    tangent = (
+        direction[0] - cos_i * normal[0],
+        direction[1] - cos_i * normal[1],
+    )
+    sin_i = math.hypot(tangent[0], tangent[1])
+    # 正入射时 sin_i=0，显式给 sin_t=0，避免 eta 为无穷时的 0×∞
+    sin_t = 0.0 if sin_i == 0.0 else (n1 / n2) * sin_i
+    if sin_t > 1.0:
+        return None  # 全反射
+    return cos_i, sin_t, normal, tangent
+
+
 def _refract(
     direction: tuple[float, float],
     normal: tuple[float, float],
@@ -77,18 +108,24 @@ def _refract(
     """按斯涅尔定律计算折射方向；发生全反射时返回 None。
 
     若光线从法线背面入射，则翻转法线再计算（折射率仍按给定 n1 -> n2）。
+    正入射（sin_t=0）时保持原方向；否则按折射方向 = eta·切向向量 +
+    cos_t·法线（切向按折射率比缩放，法向取折射角余弦）合成，归一化后
+    返回，保证多界面追迹继续使用有限的单位方向做前向求交。
     """
-    cos_i = _dot(direction, normal)
-    if cos_i < 0.0:
-        normal = (-normal[0], -normal[1])
-        cos_i = -cos_i
-    eta = n1 / n2
-    sin2_t = eta * eta * max(0.0, 1.0 - cos_i * cos_i)
-    if sin2_t > 1.0:
+    snell = _snell_angles(direction, normal, n1, n2)
+    if snell is None:
         return None  # 全反射
-    cos_t = math.sqrt(1.0 - sin2_t)
-    k = cos_t - eta * cos_i
-    return (eta * direction[0] + k * normal[0], eta * direction[1] + k * normal[1])
+    _cos_i, sin_t, normal, tangent = snell
+    if sin_t == 0.0:
+        return direction  # 正入射：保持原方向
+    eta = n1 / n2
+    cos_t = math.sqrt(1.0 - sin_t * sin_t)
+    return normalize(
+        (
+            eta * tangent[0] + cos_t * normal[0],
+            eta * tangent[1] + cos_t * normal[1],
+        )
+    )
 
 
 def fresnel_transmittance(
@@ -100,24 +137,22 @@ def fresnel_transmittance(
     """单界面菲涅耳 s/p 功率透过率（数值稳定形式，与 1 - R 精确等价）。
 
     以光线方向与界面法线求入射角余弦 cos_i（光线从法线背面入射时翻转法线），
-    再由斯涅尔定律 sin_t = (n1/n2) sin_i 求折射角余弦 cos_t。功率透过率按
+    再由斯涅尔定律 sin_t = (n1/n2) sin_i 求折射角余弦 cos_t；斯涅尔判定复用
+    _snell_angles：不取折射率比的平方，极端折射率比（如 n1=1e200 对 1）下
+    既不会因 eta² 溢出误判，也不会在正入射时出现 0×∞。功率透过率按
         Ts = 4·as·bs/(as+bs)²，as = n1·cos_i，bs = n2·cos_t
         Tp = 4·ap·bp/(ap+bp)²，ap = n2·cos_i，bp = n1·cos_t
     计算，实现时取 4·[a/(a+b)]·[b/(a+b)]：只含正项之和与不超过 1 的比值，
-    不发生 1 - R 的浮点抵消，折射率悬殊（如 1e-20 对 1）时仍能保留可表示
-    的微小正透过率。发生全反射（sin²t > 1）时返回 None。
+    不发生 1 - R 的浮点抵消，折射率悬殊（如 1e200 对 1）时仍能保留可表示
+    的微小正透过率。发生全反射（sin_t > 1）时返回 None。
     返回 (cos_i, cos_t, Ts, Tp)。
     """
     nrm = normalize(normal)
-    cos_i = _dot(direction, nrm)
-    if cos_i < 0.0:
-        nrm = (-nrm[0], -nrm[1])
-        cos_i = -cos_i
-    eta = n1 / n2
-    sin2_t = eta * eta * max(0.0, 1.0 - cos_i * cos_i)
-    if sin2_t > 1.0:
+    snell = _snell_angles(direction, nrm, n1, n2)
+    if snell is None:
         return None  # 全反射
-    cos_t = math.sqrt(max(0.0, 1.0 - sin2_t))
+    cos_i, sin_t, nrm, _tangent = snell
+    cos_t = math.sqrt(1.0 - sin_t * sin_t)
     a_s, b_s = n1 * cos_i, n2 * cos_t
     a_p, b_p = n2 * cos_i, n1 * cos_t
     sum_s = a_s + b_s
